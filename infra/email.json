@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "emailServiceName": { "type": "string" },
+    "communicationServiceName": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Communication/emailServices",
+      "apiVersion": "2023-03-31",
+      "name": "[parameters('emailServiceName')]",
+      "location": "global",
+      "properties": { "dataLocation": "United States" }
+    },
+    {
+      "type": "Microsoft.Communication/emailServices/domains",
+      "apiVersion": "2023-03-31",
+      "name": "[concat(parameters('emailServiceName'), '/AzureManagedDomain')]",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Communication/emailServices', parameters('emailServiceName'))]"
+      ],
+      "properties": {
+        "domainManagement": "AzureManaged",
+        "userEngagementTracking": "Disabled"
+      }
+    },
+    {
+      "type": "Microsoft.Communication/communicationServices",
+      "apiVersion": "2023-03-31",
+      "name": "[parameters('communicationServiceName')]",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Communication/emailServices/domains', parameters('emailServiceName'), 'AzureManagedDomain')]"
+      ],
+      "properties": {
+        "dataLocation": "United States",
+        "linkedDomains": [
+          "[resourceId('Microsoft.Communication/emailServices/domains', parameters('emailServiceName'), 'AzureManagedDomain')]"
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "communicationServiceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Communication/communicationServices', parameters('communicationServiceName'))]"
+    },
+    "domainId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Communication/emailServices/domains', parameters('emailServiceName'), 'AzureManagedDomain')]"
+    }
+  }
+}
