@@ -273,7 +273,62 @@ def safe_lines(summary: str, limit: int = 2) -> list[str]:
     return lines
 
 
-def get_completion_candidate(transcript: pathlib.Path) -> dict[str, Any] | None:
+def load_notification_policy(
+    env_path: pathlib.Path = ROOT / ".env",
+) -> dict[str, Any]:
+    defaults = {
+        "NOTIFIER_NOTIFY_CHAT": "false",
+        "NOTIFIER_NOTIFY_PLAN": "false",
+        "NOTIFIER_NOTIFY_AUTOPILOT": "true",
+        "NOTIFIER_CHANNELS": "kakao",
+    }
+    values = dict(defaults)
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            name, separator, raw = line.partition("=")
+            name = name.strip()
+            if name not in defaults:
+                continue
+            if not separator:
+                raise ValueError(f"Missing value for {name} in .env.")
+            raw = raw.strip()
+            if raw.startswith(("'", '"')):
+                quote = raw[0]
+                end = raw.find(quote, 1)
+                if end == -1 or (raw[end + 1:].strip() and not raw[end + 1:].lstrip().startswith("#")):
+                    raise ValueError(f"Invalid quoted value for {name} in .env.")
+                values[name] = raw[1:end]
+            else:
+                values[name] = raw.split("#", 1)[0].strip()
+    for name in defaults:
+        if name in os.environ:
+            values[name] = os.environ[name]
+    channels = [channel.strip() for channel in values["NOTIFIER_CHANNELS"].split(",")]
+    supported_channels = {"kakao", "azure_email"}
+    if (
+        not channels or any(channel not in supported_channels for channel in channels)
+        or len(set(channels)) != len(channels)
+    ):
+        raise ValueError("NOTIFIER_CHANNELS must contain kakao and/or azure_email, without duplicates.")
+    policy: dict[str, Any] = {}
+    for name in ("CHAT", "PLAN", "AUTOPILOT"):
+        key = f"NOTIFIER_NOTIFY_{name}"
+        value = values[key].strip().lower()
+        if value not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false.")
+        policy[name.lower()] = value == "true"
+    if policy["plan"]:
+        raise ValueError("Plan notifications are not supported yet. Set NOTIFIER_NOTIFY_PLAN=false.")
+    policy["channels"] = channels
+    return policy
+
+
+def get_completion_candidate(
+    transcript: pathlib.Path, *, notify_chat: bool = False, notify_autopilot: bool = True,
+) -> dict[str, Any] | None:
     mode = None
     candidate = None
     task = None
@@ -296,7 +351,11 @@ def get_completion_candidate(transcript: pathlib.Path) -> dict[str, Any] | None:
             data = event.get("data")
             if not event.get("type") or not isinstance(data, dict):
                 continue
-            if event.get("agentId") or data.get("parentAgentTaskId"):
+            # Current CLI also stamps root human prompts with a routing task ID.
+            if event.get("agentId") or (
+                data.get("parentAgentTaskId")
+                and not (event["type"] == "user.message" and data.get("delivery") == "idle")
+            ):
                 continue
             kind = event["type"]
             if kind == "session.start":
@@ -307,8 +366,7 @@ def get_completion_candidate(transcript: pathlib.Path) -> dict[str, Any] | None:
             elif kind == "session.mode_changed":
                 saw_sdk_event = True
                 mode = data.get("newMode")
-                if mode != "autopilot":
-                    candidate = None
+                candidate = None
             elif kind == "user.message":
                 source = data.get("source") or ""
                 if not isinstance(source, str):
@@ -322,10 +380,27 @@ def get_completion_candidate(transcript: pathlib.Path) -> dict[str, Any] | None:
                     if data.get("agentMode"):
                         saw_sdk_event = True
                         mode = data["agentMode"]
+            elif kind in ("abort", "session.abort", "session.error", "assistant.turn_start"):
+                candidate = None
+            elif kind == "assistant.message":
+                if mode == "interactive":
+                    candidate = None
+                    if (
+                        notify_chat and task and event.get("id")
+                        and data.get("phase") == "final_answer"
+                        and not data.get("toolRequests")
+                        and isinstance(data.get("content"), str)
+                        and data["content"].strip()
+                    ):
+                        candidate = {
+                            "eventId": event["id"], "summary": data["content"],
+                            "task": task, "timestamp": event.get("timestamp"),
+                            "startedAt": started_at, "mode": "interactive",
+                        }
             elif kind == "session.task_complete":
                 candidate = None
                 if (
-                    mode == "autopilot"
+                    mode == "autopilot" and notify_autopilot
                     and data.get("success") is not False
                     and data.get("outcome") in (None, "", "completed")
                     and event.get("id")
@@ -338,9 +413,10 @@ def get_completion_candidate(transcript: pathlib.Path) -> dict[str, Any] | None:
                         "task": task,
                         "timestamp": event.get("timestamp"),
                         "startedAt": started_at,
+                        "mode": "autopilot",
                     }
     if not saw_sdk_event:
-        raise RuntimeError("Unsupported transcript: SDK mode and task-completion events are required.")
+        raise RuntimeError("Unsupported transcript: explicit SDK mode and completion events are required.")
     return candidate
 
 
@@ -371,7 +447,10 @@ def parse_timestamp(value: Any) -> dt.datetime:
     return parsed
 
 
-def get_kakao_content(project: str, task: str, summary: str, started_at: str, completed_at: str) -> str:
+def get_kakao_content(
+    project: str, task: str, summary: str, started_at: str, completed_at: str,
+    *, mode: str | None = None,
+) -> str:
     start, end = parse_timestamp(started_at), parse_timestamp(completed_at)
     elapsed = int((end - start).total_seconds())
     if elapsed < 0:
@@ -385,6 +464,9 @@ def get_kakao_content(project: str, task: str, summary: str, started_at: str, co
         f"프로젝트: {project_label}\n시작: {start.astimezone().strftime(fmt)}"
         f"\n완료: {end.astimezone().strftime(fmt)}\n소요: {duration}"
     )
+    if mode is not None:
+        labels = {"interactive": "[Chat] 응답 완료", "autopilot": "[Autopilot] 작업 완료"}
+        metadata = labels[mode] + "\n" + metadata
     prefix, separator = f"{metadata}\n요청 요약: ", "\n결과 요약: "
     budget = 200 - utf16_length(prefix) - utf16_length(separator)
     task_limit = budget // 2
@@ -493,13 +575,37 @@ def send_kakao(
         raise RuntimeError("Kakao did not confirm a successful send. Inspect your app permissions and quota.")
 
 
-def email_summary(project: str, task: str, summary: str) -> dict[str, str]:
+def email_summary(
+    project: str, task: str, summary: str, *,
+    mode: str | None = None, started_at: str | None = None, completed_at: str | None = None,
+) -> dict[str, str]:
     project_label = truncate(safe_lines(project, 1)[0], 80)
     task_label = truncate(safe_lines(task, 1)[0], 120)
     result = " ".join(safe_lines(summary))
+    labels = {"interactive": "Chat response complete", "autopilot": "Autopilot task complete"}
+    if mode is not None and mode not in labels:
+        raise ValueError("Unsupported completion mode for email.")
+    subject_label = f"[{labels[mode]}] " if mode else ""
+    body = [
+        f"Project: {project_label}",
+        f"Task: {task_label}",
+    ]
+    if started_at is not None or completed_at is not None:
+        start, end = parse_timestamp(started_at), parse_timestamp(completed_at)
+        elapsed = int((end - start).total_seconds())
+        if elapsed < 0:
+            raise ValueError("Task completion precedes its start.")
+        duration = f"{elapsed // 3600:02}:{(elapsed % 3600) // 60:02}:{elapsed % 60:02}"
+        fmt = "%Y-%m-%d %H:%M:%S %z"
+        body.extend((
+            f"Started: {start.astimezone().strftime(fmt)}",
+            f"Completed: {end.astimezone().strftime(fmt)}",
+            f"Duration: {duration}",
+        ))
+    body.append(f"Result: {truncate(result, 240)}")
     return {
-        "subject": f"[Copilot] {project_label} | {task_label}",
-        "body": f"Project: {project_label} | Task: {task_label}\nResult: {truncate(result, 240)}",
+        "subject": f"[Copilot] {subject_label}{project_label} | {task_label}",
+        "body": "\n".join(body),
     }
 
 
@@ -658,20 +764,30 @@ def install_hook() -> None:
     target = hooks_dir / "tools-copilot-notifier.json"
     python = pathlib.Path(sys.executable).resolve()
     script = pathlib.Path(__file__).resolve()
-    command = "& " + subprocess.list2cmdline([str(python), str(script), "notify-completion"])
     if target.exists():
         existing = read_json(target)
         hooks = existing.get("hooks", {}).get("Stop", [])
         ours = False
         if hooks and isinstance(hooks[0], dict):
             old = hooks[0].get("powershell", "")
-            ours = str(script).lower() in old.lower() or "Notify-Completion.ps1" in old
+            old_paths = (
+                script, ROOT / "scripts" / "Notify-Completion.ps1",
+                ROOT.parent / "Copilot Notifier" / "scripts" / "Notify-Completion.ps1",
+            )
+            ours = any(f'"{path}"'.lower() in old.lower() for path in old_paths)
+            ours = ours or (
+                hooks[0].get("exec") == str(python)
+                and hooks[0].get("args") == [str(script), "notify-completion"]
+            )
         if not ours:
             raise RuntimeError("A different hook already uses this filename. It has not been overwritten.")
     hooks_dir.mkdir(parents=True, exist_ok=True)
     atomic_json(target, {
         "version": 1,
-        "hooks": {"Stop": [{"type": "command", "powershell": command, "timeoutSec": 90}]},
+        "hooks": {"Stop": [{
+            "type": "command", "exec": str(python),
+            "args": [str(script), "notify-completion"], "timeoutSec": 90,
+        }]},
     })
     print("User-level Stop hook installed. Restart Copilot CLI and reload VS Code to load it.")
 
@@ -687,11 +803,21 @@ def notify_completion(config_path: pathlib.Path) -> None:
         return
     if hook.get("hook_event_name") and hook["hook_event_name"] != "Stop":
         return
+    stop_reason = hook.get("stop_reason") or hook.get("stopReason")
+    if stop_reason and stop_reason != "end_turn":
+        return
+    if hook.get("stop_hook_active"):
+        return
+    policy = load_notification_policy()
     session_id = hook.get("session_id") or hook.get("sessionId")
     transcript = hook.get("transcript_path") or hook.get("transcriptPath")
     if not session_id or not transcript:
         raise ValueError("Completion hook is missing session or transcript metadata.")
-    candidate = get_completion_candidate(pathlib.Path(transcript))
+    candidate = get_completion_candidate(
+        pathlib.Path(transcript),
+        notify_chat=policy["chat"] and stop_reason == "end_turn",
+        notify_autopilot=policy["autopilot"],
+    )
     if not candidate:
         return
     if not hook.get("cwd"):
@@ -699,27 +825,55 @@ def notify_completion(config_path: pathlib.Path) -> None:
     project = get_project_label(hook["cwd"])
     if not isinstance(candidate.get("task"), str) or not candidate["task"].strip():
         raise ValueError("The accepted completion has no human task title. No message was submitted.")
-    text = get_kakao_content(
-        project, candidate["task"], candidate["summary"],
-        candidate.get("startedAt"), candidate.get("timestamp"),
-    )
-    load_kakao_config(config_path)
-    state_dir = config_path.parent / "kakao-receipts"
     operation_id = get_operation_id(f"{session_id}:{candidate['eventId']}")
-    receipt_path = state_dir / f"{operation_id}.json"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with FileLock(state_dir / f"{operation_id}.lock"):
-            if receipt_path.exists():
-                receipt = read_json(receipt_path)
-                if receipt.get("status") == "Succeeded":
-                    return
-                raise RuntimeError("A prior Kakao send failed or is uncertain. Inspect the receipt and chat before retrying.")
-            send_kakao(config_path, text, operation_id, receipt_path)
-    except RuntimeError as exc:
-        if "already handling" in str(exc):
-            raise RuntimeError("Another notifier is handling this completion. No duplicate message was submitted.") from exc
-        raise
+    errors: list[str] = []
+    for channel in policy["channels"]:
+        try:
+            if channel == "kakao":
+                text = get_kakao_content(
+                    project, candidate["task"], candidate["summary"],
+                    candidate.get("startedAt"), candidate.get("timestamp"),
+                    mode=candidate["mode"],
+                )
+                load_kakao_config(config_path)
+                state_dir = config_path.parent / "kakao-receipts"
+                receipt_path = state_dir / f"{operation_id}.json"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                with FileLock(state_dir / f"{operation_id}.lock"):
+                    if receipt_path.exists():
+                        receipt = read_json(receipt_path)
+                        if receipt.get("status") == "Succeeded":
+                            continue
+                        raise RuntimeError(
+                            "A prior Kakao send failed or is uncertain. Inspect the receipt and chat before retrying."
+                        )
+                    send_kakao(config_path, text, operation_id, receipt_path)
+            elif channel == "azure_email":
+                email_config_path = config_path.parent / "config.json"
+                email_config = validate_email_config(email_config_path)
+                content = email_summary(
+                    project, candidate["task"], candidate["summary"],
+                    mode=candidate["mode"], started_at=candidate.get("startedAt"),
+                    completed_at=candidate.get("timestamp"),
+                )
+                state_dir = email_config_path.parent / "receipts"
+                receipt_path = state_dir / f"{operation_id}.json"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                with FileLock(state_dir / f"{operation_id}.lock"):
+                    if receipt_path.exists():
+                        receipt = read_json(receipt_path)
+                        if receipt.get("status") == "Succeeded":
+                            continue
+                        raise RuntimeError(
+                            "A prior email send failed or is uncertain. Inspect the receipt before retrying."
+                        )
+                    send_email(
+                        email_config, content["subject"], content["body"], operation_id, receipt_path,
+                    )
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"{channel}: {exc}")
+    if errors:
+        raise RuntimeError("Completion notification failed (" + "; ".join(errors) + ").")
 
 
 def deploy_email(args: argparse.Namespace) -> None:

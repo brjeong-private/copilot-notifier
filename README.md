@@ -1,14 +1,13 @@
 # Copilot Notifier
 
-GitHub Copilot의 **Autopilot 작업 완료를 카카오톡 나와의 채팅으로 알려주는**
+GitHub Copilot의 **챗 응답·Autopilot 작업 완료를 카카오톡과/또는 이메일로 알려주는**
 Python 기반 Windows 도구입니다. 별도 서버나 추가 AI 요약 모델은 사용하지 않습니다.
-Azure Communication Services(ACS) 이메일은 배포·수동 테스트만 지원합니다.
 
 ## 준비
 
-Windows, Python 3.10 이상, Copilot CLI가 필요합니다. Python 외부 패키지는 없으며,
-Windows Copilot 훅 실행에는 PowerShell 7 이상이 필요합니다. 기능 로직은 모두
-`scripts\notifier.py`에 있습니다.
+Windows, Python 3.10 이상, Copilot CLI가 필요합니다. Python 외부 패키지나
+PowerShell 스크립트 없이 훅에서 Python을 직접 실행합니다.
+기능 로직은 모두 `scripts\notifier.py`에 있습니다.
 
 아래 명령은 저장소 루트에서 실행합니다. `uv`를 쓰는 경우 `python` 대신
 `uv run --python 3.12 python`을 사용하면 됩니다.
@@ -38,15 +37,32 @@ VS Code는 Copilot harness가 같은 SDK 이벤트 기록을 제공할 때만 �
 
 ### 알림 내용과 범위
 
-프로젝트명, 시작·완료 시각, 소요 시간, 요청·결과 요약과 프로젝트 링크를 보냅니다.
+알림 구분, 프로젝트명, 시작·완료 시각, 소요 시간, 요청·결과 요약과 프로젝트 링크를 보냅니다.
 텍스트는 전체 200자 이내이며, 기존 요청·완료 요약을 잘라 사용합니다.
 
-- 명시적인 Autopilot 모드의 수락된 루트 완료 이벤트만 발송합니다.
-- 일반 챗·Plan·하위 에이전트 완료·입력 대기·실패에는 알리지 않습니다.
-- 이메일 자동 발송, 채널 동시 발송, `.env` 로딩은 아직 지원하지 않습니다.
-  [`.env.example`](.env.example)은 향후 설정 예시일 뿐 현재 동작을 바꾸지 않습니다.
+- 기본은 수락된 Autopilot 루트 완료 이벤트의 `[Autopilot] 작업 완료` 알림입니다.
+- 일반 챗은 `.env`에서 아래 설정을 켜면 루트 최종 응답 뒤 `[Chat] 응답 완료`를 보냅니다.
+  이는 응답이 끝났다는 뜻이며 작업 성공을 판정하는 알림은 아닙니다.
+- 중간 응답·도구 실행·Plan·하위 에이전트 완료·입력 대기·중단에는 보내지 않습니다.
+  명시적인 SDK 모드와 `final_answer` 이벤트를 확인할 수 없는 기록도 제외합니다.
 
-## Azure 이메일 — 수동 테스트
+저장소 루트의 `.env`에서 알림 정책을 설정합니다. 훅 실행마다 읽으므로 설정값만 바꿀 때는
+재시작할 필요가 없습니다. 프로세스 환경변수가 `.env`보다 우선합니다.
+
+```dotenv
+NOTIFIER_CHANNELS=kakao
+NOTIFIER_NOTIFY_CHAT=true
+NOTIFIER_NOTIFY_PLAN=false
+NOTIFIER_NOTIFY_AUTOPILOT=true
+```
+
+`NOTIFIER_CHANNELS`는 `kakao`, `azure_email`, `kakao,azure_email` 중 하나를 사용합니다.
+기본값은 `kakao`이며, 이메일만 사용하면 카카오 연결은 필요하지 않습니다.
+챗 알림의 기본값은 `false`입니다. 같은 챗/Autopilot 정책이 선택한 모든 채널에 적용되며,
+Plan 알림은 지원하지 않습니다. 지원하지 않는 채널이나 잘못된 boolean 값은 오류로 표시합니다.
+`.env.example`의 인증·Azure 설정 예시는 자동으로 읽지 않으며, 키·토큰은 위 연결·배포 명령으로 관리합니다.
+
+## Azure 이메일
 
 Azure CLI와 배포·발송 권한이 필요합니다. 아래 배포 명령은 **실제 리소스를 생성**하므로
 구독·수신 주소와 비용을 확인하세요. 카카오톡만 사용한다면 필요하지 않습니다.
@@ -61,6 +77,11 @@ python .\scripts\notifier.py send-test-email
 데이터 위치는 `United States`이며, 발송 인증은 Azure CLI의 Microsoft Entra 토큰을
 사용합니다. 액세스 키는 저장하지 않습니다. 테스트 성공은 ACS 발송 작업 성공이며,
 받은편지함 도착 확인은 아닙니다.
+
+자동 이메일을 받으려면 `.env`에 `NOTIFIER_CHANNELS=azure_email`을 설정합니다.
+카카오와 함께 받으려면 `NOTIFIER_CHANNELS=kakao,azure_email`을 사용합니다.
+발송은 선택한 채널별 완료 영수증으로 중복을 방지하며, 전송 상태가 불확실한 이메일은
+자동 재시도하지 않습니다.
 
 ## 설정·주의사항
 

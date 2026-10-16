@@ -16,7 +16,7 @@ from unittest import mock
 import notifier
 
 
-class CompletionTests(unittest.TestCase):
+class CompletionFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.transcript = pathlib.Path(self.temp.name) / "events.jsonl"
@@ -37,6 +37,21 @@ class CompletionTests(unittest.TestCase):
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
         )
 
+    def chat_events(self, mode: str = "interactive") -> list[dict]:
+        return [
+            self.start,
+            {
+                "type": "user.message", "timestamp": "2026-10-16T09:00:00Z", "id": "request-1",
+                "data": {"content": "Complete a small change", "agentMode": mode},
+            },
+            {
+                "type": "assistant.message", "timestamp": "2026-10-16T09:01:00Z", "id": "reply-1",
+                "data": {"content": "The requested change is ready.", "phase": "final_answer", "toolRequests": []},
+            },
+        ]
+
+
+class CompletionTests(CompletionFixture):
     def test_accepts_root_autopilot_completion(self) -> None:
         self.write_events(self.start, self.auto, self.complete)
         self.assertEqual(notifier.get_completion_candidate(self.transcript)["eventId"], "done-1")
@@ -84,6 +99,196 @@ class CompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Unsupported transcript"):
             notifier.get_completion_candidate(self.transcript)
 
+    def test_chat_final_response_is_opt_in(self) -> None:
+        self.write_events(*self.chat_events())
+        self.assertIsNone(notifier.get_completion_candidate(self.transcript))
+        candidate = notifier.get_completion_candidate(self.transcript, notify_chat=True)
+        self.assertEqual(candidate["eventId"], "reply-1")
+        self.assertEqual(candidate["mode"], "interactive")
+        self.assertEqual(candidate["startedAt"], "2026-10-16T09:00:00Z")
+
+    def test_chat_requires_explicit_final_phase_without_tools(self) -> None:
+        for phase, tools in (("commentary", []), (None, []), ("final_answer", [{"name": "test"}])):
+            with self.subTest(phase=phase, tools=tools):
+                events = self.chat_events()
+                events[-1]["data"].update(phase=phase, toolRequests=tools)
+                self.write_events(*events)
+                self.assertIsNone(notifier.get_completion_candidate(self.transcript, notify_chat=True))
+
+    def test_chat_excludes_plan_unknown_and_autopilot_final_messages(self) -> None:
+        for mode in ("plan", "unknown", "autopilot", None):
+            with self.subTest(mode=mode):
+                self.write_events(*self.chat_events(mode))
+                self.assertIsNone(notifier.get_completion_candidate(self.transcript, notify_chat=True))
+
+    def test_chat_excludes_child_responses(self) -> None:
+        events = self.chat_events()
+        events[-1]["agentId"] = "child"
+        self.write_events(*events)
+        self.assertIsNone(notifier.get_completion_candidate(self.transcript, notify_chat=True))
+
+    def test_root_idle_prompt_routing_task_id_does_not_make_it_a_subagent(self) -> None:
+        events = self.chat_events()
+        events[1]["data"].update(parentAgentTaskId="root-routing-task", delivery="idle")
+        self.write_events(*events)
+        self.assertEqual(
+            notifier.get_completion_candidate(self.transcript, notify_chat=True)["eventId"],
+            "reply-1",
+        )
+
+    def test_new_work_error_and_resume_invalidate_old_chat_final(self) -> None:
+        for kind, data in (
+            ("user.message", {"content": "Next request"}),
+            ("session.resume", {}),
+            ("session.error", {}),
+            ("abort", {}),
+            ("assistant.turn_start", {}),
+            ("session.mode_changed", {"newMode": "plan"}),
+            ("assistant.message", {"content": "Continuing", "phase": "commentary"}),
+        ):
+            with self.subTest(kind=kind):
+                self.write_events(*self.chat_events(), {"type": kind, "data": data})
+                self.assertIsNone(notifier.get_completion_candidate(self.transcript, notify_chat=True))
+
+    def test_autopilot_can_be_disabled(self) -> None:
+        self.write_events(self.start, self.auto, self.complete)
+        self.assertIsNone(notifier.get_completion_candidate(self.transcript, notify_autopilot=False))
+
+
+class PolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.temp.name) / ".env"
+        self.environment = mock.patch.dict(os.environ, {}, clear=True)
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temp.cleanup()
+
+    def test_missing_env_preserves_defaults(self) -> None:
+        self.assertEqual(
+            notifier.load_notification_policy(self.path),
+            {"chat": False, "plan": False, "autopilot": True, "channels": ["kakao"]},
+        )
+
+    def test_env_chat_and_boolean_parsing(self) -> None:
+        self.path.write_text(
+            'NOTIFIER_NOTIFY_CHAT="true" # enabled\nNOTIFIER_NOTIFY_AUTOPILOT=false\n'
+            'KAKAO_CLIENT_SECRET=unused-do-not-execute\n', encoding="utf-8",
+        )
+        self.assertEqual(
+            notifier.load_notification_policy(self.path),
+            {"chat": True, "plan": False, "autopilot": False, "channels": ["kakao"]},
+        )
+
+    def test_email_channel_can_be_selected_alone_or_with_kakao(self) -> None:
+        for channels in ("azure_email", "kakao, azure_email"):
+            with self.subTest(channels=channels):
+                self.path.write_text(f"NOTIFIER_CHANNELS={channels}\n", encoding="utf-8")
+                self.assertEqual(
+                    notifier.load_notification_policy(self.path)["channels"],
+                    [item.strip() for item in channels.split(",")],
+                )
+
+    def test_process_environment_overrides_file(self) -> None:
+        self.path.write_text("NOTIFIER_NOTIFY_CHAT=false\n", encoding="utf-8")
+        os.environ["NOTIFIER_NOTIFY_CHAT"] = "true"
+        self.assertTrue(notifier.load_notification_policy(self.path)["chat"])
+
+    def test_invalid_or_unsupported_settings_are_explicit_errors(self) -> None:
+        for line in (
+            "NOTIFIER_NOTIFY_CHAT=yes", "NOTIFIER_NOTIFY_CHAT", 'NOTIFIER_NOTIFY_CHAT="true',
+            "NOTIFIER_NOTIFY_PLAN=true", "NOTIFIER_CHANNELS=email",
+            "NOTIFIER_CHANNELS=kakao,unsupported", "NOTIFIER_CHANNELS=kakao,kakao",
+            "NOTIFIER_CHANNELS=",
+        ):
+            with self.subTest(line=line):
+                self.path.write_text(line, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    notifier.load_notification_policy(self.path)
+
+
+class HookTests(CompletionFixture):
+    def invoke(self, hook: dict) -> None:
+        with mock.patch.object(notifier.sys, "stdin", io.StringIO(json.dumps(hook))):
+            notifier.notify_completion(pathlib.Path(self.temp.name) / "kakao.json")
+
+    def test_actual_stop_payload_shape_sends_once(self) -> None:
+        self.write_events(*self.chat_events())
+        hook = {
+            "sessionId": "real-session", "transcriptPath": str(self.transcript),
+            "stopReason": "end_turn", "stop_hook_active": False, "cwd": self.temp.name,
+        }
+
+        def send(config_path: pathlib.Path, text: str, operation: str, receipt: pathlib.Path) -> None:
+            notifier.write_receipt(receipt, operationId=operation, provider="kakao", status="Succeeded")
+
+        with mock.patch.object(
+            notifier, "load_notification_policy",
+            return_value={"chat": True, "autopilot": True, "channels": ["kakao"]},
+        ), mock.patch.object(notifier, "load_kakao_config", return_value={}), mock.patch.object(
+            notifier, "send_kakao", side_effect=send,
+        ) as sender:
+            self.invoke(hook)
+            self.invoke(hook)
+        self.assertEqual(sender.call_count, 1)
+        self.assertIn("[Chat] 응답 완료", sender.call_args.args[1])
+
+    def test_invalid_stop_or_subagent_does_not_send(self) -> None:
+        self.write_events(*self.chat_events())
+        base = {
+            "session_id": "session", "transcript_path": str(self.transcript),
+            "cwd": self.temp.name, "hook_event_name": "Stop",
+        }
+        with mock.patch.object(
+            notifier, "load_notification_policy",
+            return_value={"chat": True, "autopilot": True, "channels": ["kakao"]},
+        ), mock.patch.object(notifier, "send_kakao") as sender:
+            for fields in (
+                {"stop_reason": "aborted"}, {"hook_event_name": "SubagentStop"},
+                {"agent_id": "child"}, {"stop_hook_active": True}, {},
+            ):
+                self.invoke({**base, **fields})
+        sender.assert_not_called()
+
+    def test_email_only_completion_sends_once_without_kakao_credentials(self) -> None:
+        self.write_events(
+            self.start,
+            {
+                "type": "user.message", "timestamp": "2026-10-16T09:00:00Z",
+                "data": {"content": "Complete a small change", "agentMode": "autopilot"},
+            },
+            self.auto,
+            self.complete,
+        )
+        hook = {
+            "session_id": "email-session", "transcript_path": str(self.transcript),
+            "hook_event_name": "Stop", "stop_reason": "end_turn", "cwd": self.temp.name,
+        }
+        email_config = {
+            "subscriptionId": "test", "endpoint": "https://example.communication.azure.com",
+            "sender": "sender@example.test", "recipient": "recipient@example.test",
+        }
+
+        def send(config: dict, subject: str, body: str, operation: str, receipt: pathlib.Path) -> None:
+            notifier.write_receipt(receipt, operationId=operation, status="Succeeded")
+
+        with mock.patch.object(
+            notifier, "load_notification_policy",
+            return_value={"chat": False, "autopilot": True, "channels": ["azure_email"]},
+        ), mock.patch.object(
+            notifier, "validate_email_config", return_value=email_config,
+        ), mock.patch.object(
+            notifier, "send_email", side_effect=send,
+        ) as sender, mock.patch.object(notifier, "load_kakao_config") as kakao:
+            self.invoke(hook)
+            self.invoke(hook)
+        self.assertEqual(sender.call_count, 1)
+        self.assertIn("[Autopilot task complete]", sender.call_args.args[1])
+        self.assertIn("Duration: 00:01:05", sender.call_args.args[2])
+        kakao.assert_not_called()
+
 
 class FormattingTests(unittest.TestCase):
     def test_summary_filters_secrets_code_and_limits_lines(self) -> None:
@@ -107,8 +312,11 @@ class FormattingTests(unittest.TestCase):
         content = notifier.email_summary(
             "tools", "Add completion emails\nPrivate full prompt",
             "Azure email is ready.\nAutopilot notifications are enabled.\nExtra details.",
+            mode="autopilot", started_at="2026-10-16T09:00:00Z",
+            completed_at="2026-10-16T09:01:05Z",
         )
-        self.assertEqual(content["subject"], "[Copilot] tools | Add completion emails")
+        self.assertEqual(content["subject"], "[Copilot] [Autopilot task complete] tools | Add completion emails")
+        self.assertIn("Duration: 00:01:05", content["body"])
         self.assertIn("Result: Azure email is ready. Autopilot notifications are enabled.", content["body"])
         self.assertNotIn("Private full prompt", str(content))
 
@@ -138,6 +346,14 @@ class FormattingTests(unittest.TestCase):
             with self.subTest(started=started, completed=completed):
                 with self.assertRaises(ValueError):
                     notifier.get_kakao_content("tools", "Task", "Result", started, completed)
+
+    def test_chat_label_fits_kakao_limit_including_emoji(self) -> None:
+        text = notifier.get_kakao_content(
+            "project" * 20, "😀" * 200, "result" * 100,
+            "2026-10-16T09:00:00Z", "2026-10-18T10:01:05Z", mode="interactive",
+        )
+        self.assertTrue(text.startswith("[Chat] 응답 완료\n"))
+        self.assertLessEqual(notifier.utf16_length(text), 200)
 
     def test_email_config_rejects_unsafe_endpoint_and_accepts_acs_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -258,17 +474,18 @@ class ReceiptTests(unittest.TestCase):
             self.assertEqual(json.loads(receipt.read_text())["status"], "Pending")
             self.assertEqual(request.call_count, 1)
 
-    def test_hook_installer_uses_python_in_the_copilot_windows_entrypoint(self) -> None:
+    def test_hook_installer_runs_python_directly_and_is_repeatable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = pathlib.Path(temporary)
             with mock.patch.dict(os.environ, {"COPILOT_HOME": str(home)}):
                 notifier.install_hook()
+                notifier.install_hook()
             hook_path = home / "hooks" / "tools-copilot-notifier.json"
             hook = json.loads(hook_path.read_text(encoding="utf-8"))
-            command = hook["hooks"]["Stop"][0]["powershell"]
-            self.assertTrue(command.startswith("& "))
-            self.assertIn(str(pathlib.Path(notifier.__file__).resolve()), command)
-            self.assertNotIn("Notify-Completion.ps1", command)
+            entry = hook["hooks"]["Stop"][0]
+            self.assertEqual(entry["exec"], str(pathlib.Path(sys.executable).resolve()))
+            self.assertEqual(entry["args"], [str(pathlib.Path(notifier.__file__).resolve()), "notify-completion"])
+            self.assertNotIn("powershell", entry)
 
 
 def run_tests() -> None:
